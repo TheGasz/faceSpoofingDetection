@@ -458,7 +458,7 @@ def _main():
     parser.add_argument("--mode", choices=["move", "copy"], default="move")
     parser.add_argument("--dry_run", action="store_true", help="Preview saja, tidak mengubah file apapun.")
     parser.add_argument("--on_conflict", choices=["rename", "skip", "overwrite"], default="rename")
-    parser.add_argument("--report", default=default_report)
+    parser.add_argument("--report", default=None, help="Path file report CSV (opsional).")
     parser.add_argument(
         "--rename_to_target_convention",
         action="store_true",
@@ -471,13 +471,15 @@ def _main():
     )
     args = parser.parse_args()
 
+    report_path = args.report if args.report is not None else (None if args.dry_run else default_report)
+
     run_sorting(
         base_dir=args.base_dir,
         csv_dir=args.csv_dir,
         mode=args.mode,
         dry_run=args.dry_run,
         on_conflict=args.on_conflict,
-        report_path=args.report,
+        report_path=report_path,
         rename_to_target_convention=args.rename_to_target_convention,
         skip_exact_duplicates_in_target=args.skip_exact_duplicates_in_target,
     )
