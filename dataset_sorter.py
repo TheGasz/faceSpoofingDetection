@@ -17,31 +17,25 @@ Cara kerja singkat:
    dicatat ke report CSV supaya bisa diaudit / dry-run dulu sebelum
    benar-benar dieksekusi.
 
-Script ini TIDAK butuh Google Colab -- bisa dijalankan lokal juga lewat
-CLI:
-
-    python dataset_sorter.py --base_dir /path/dataset --csv_dir /path/dataset --dry_run
-
-Import di notebook:
-
-    from dataset_sorter import run_sorting
-    report_df = run_sorting(base_dir=..., csv_dir=..., mode="move", dry_run=True)
+Contoh eksekusi CLI:
+    python dataset_sorter.py --base_dir Convnext/train --csv_dir data/relabeling_csv --dry_run
 """
 
+import argparse
+import csv
+import hashlib
 import os
 import re
-import csv
 import shutil
-import argparse
-from dataclasses import dataclass, field
-from typing import Optional
+from collections import Counter
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
 # 1. KONFIGURASI LABEL -> (nama folder, prefix nama file)
-#    Tambah / ubah di sini kalau ada kategori baru atau kode label baru.
 # ---------------------------------------------------------------------------
-LABEL_MAP = {
+LABEL_MAP: Dict[str, Tuple[str, str]] = {
     "MANNE":      ("fake_mannequin", "mannequin"),
     "MANNEQUIN":  ("fake_mannequin", "mannequin"),
     "MASK":       ("fake_mask",      "mask"),
@@ -55,9 +49,6 @@ LABEL_MAP = {
     "REALPERSON": ("realperson",     "real"),
 }
 
-# Konfigurasi setiap CSV: folder asal (source), nama kolom id, kolom label
-# sekarang, kolom label seharusnya, dan apakah kolom id sudah berisi nama
-# file lengkap (True) atau cuma angka urut yang perlu direkonstruksi (False).
 CSV_CONFIGS = [
     {
         "csv_name": "FOLDER_FAKE_MANNE.CSV",
@@ -127,10 +118,10 @@ class ActionResult:
     current_label: str
     target_label: str
     target_folder: Optional[str]
-    status: str            # moved / copied / already_correct / not_found / error / dry_run
+    status: str            # moved / copied / already_correct / not_found / error / dry_run / skipped
     detail: str = ""
-    target_prefix: Optional[str] = None   # prefix nama file folder tujuan, mis. "mask"
-    final_filename: Optional[str] = None  # nama file setelah dipindah (bisa beda dari filename kalau di-rename)
+    target_prefix: Optional[str] = None
+    final_filename: Optional[str] = None
 
 
 def _clean_header(name: str) -> str:
@@ -141,25 +132,33 @@ def _normalize_label(label: str) -> str:
     return str(label).strip().upper()
 
 
-def _resolve_label(label: str):
+def _resolve_label(label: str) -> Tuple[Optional[str], Optional[str]]:
     """Return (folder_name, prefix) for a label code, or (None, None) if unknown."""
     key = _normalize_label(label)
     return LABEL_MAP.get(key, (None, None))
 
 
-def _build_filename_index(folder_path: str):
+def _file_md5(filepath: str) -> str:
+    hasher = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _build_filename_index(folder_path: str) -> Dict[Tuple[str, int], str]:
     """
     Scan a folder once and build an index:
         {(prefix_lower, numeric_id): actual_filename}
     so we can resolve "id-only" CSV rows (e.g. id=7 -> mannequin_007.jpg)
     without guessing extensions or zero-padding.
     """
-    index = {}
+    index: Dict[Tuple[str, int], str] = {}
     if not os.path.isdir(folder_path):
         return index
 
     pattern = re.compile(r"^(?P<prefix>[a-zA-Z]+)_(?P<num>\d+)\.(?P<ext>\w+)$")
-    for fname in os.listdir(folder_path):
+    for fname in sorted(os.listdir(folder_path)):
         full = os.path.join(folder_path, fname)
         if not os.path.isfile(full):
             continue
@@ -174,23 +173,26 @@ def _build_filename_index(folder_path: str):
     return index
 
 
-def _read_csv_rows(csv_path: str):
+def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return []
         reader.fieldnames = [_clean_header(h) for h in reader.fieldnames]
         rows = []
         for row in reader:
-            rows.append({_clean_header(k): (v.strip() if isinstance(v, str) else v)
-                         for k, v in row.items()})
+            rows.append({
+                _clean_header(k): (v.strip() if isinstance(v, str) else v)
+                for k, v in row.items() if k is not None
+            })
         return rows
 
 
-def build_tasks(base_dir: str, csv_dir: str):
+def build_tasks(base_dir: str, csv_dir: str) -> List[ActionResult]:
     """
-    Read every configured CSV and turn it into a flat list of ActionResult
-    (status is not yet decided -- this just resolves filenames/paths).
+    Read every configured CSV and turn it into a flat list of ActionResult.
     """
-    tasks = []
+    tasks: List[ActionResult] = []
 
     for cfg in CSV_CONFIGS:
         csv_path = os.path.join(csv_dir, cfg["csv_name"])
@@ -202,7 +204,6 @@ def build_tasks(base_dir: str, csv_dir: str):
 
         rows = _read_csv_rows(csv_path)
 
-        # Untuk CSV yang id-nya cuma angka, bangun index nama file dulu.
         file_index = None
         if not cfg["id_is_filename"]:
             file_index = _build_filename_index(source_folder_path)
@@ -212,7 +213,6 @@ def build_tasks(base_dir: str, csv_dir: str):
             current_label = row.get(cfg["current_col"], "")
             target_label = row.get(cfg["target_col"], "")
 
-            # --- resolve nama file aktual ---
             filename = None
             if cfg["id_is_filename"]:
                 filename = raw_id
@@ -259,11 +259,10 @@ def build_tasks(base_dir: str, csv_dir: str):
     return tasks
 
 
-def _scan_existing_max(dst_dir: str, prefix: str):
+def _scan_existing_max(dst_dir: str, prefix: str) -> Tuple[int, int]:
     """
     Cari nomor urut tertinggi yang sudah dipakai file berpola
-    '<prefix>_<angka>.<ext>' di dst_dir, plus lebar zero-padding yang
-    dipakai (mis. 3 -> 001). Default width 3 kalau folder belum ada isinya.
+    '<prefix>_<angka>.<ext>' di dst_dir, plus lebar zero-padding yang dipakai.
     """
     pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.\w+$", re.IGNORECASE)
     max_num, width = 0, 3
@@ -279,30 +278,40 @@ def _scan_existing_max(dst_dir: str, prefix: str):
     return max_num, width
 
 
-def execute_tasks(tasks, base_dir: str, mode: str = "move", dry_run: bool = True,
-                   on_conflict: str = "rename", rename_to_target_convention: bool = False):
+def execute_tasks(
+    tasks: List[ActionResult],
+    base_dir: str,
+    mode: str = "move",
+    dry_run: bool = True,
+    on_conflict: str = "rename",
+    rename_to_target_convention: bool = False,
+    skip_exact_duplicates_in_target: bool = False,
+) -> List[ActionResult]:
     """
     Execute the pending tasks: move/copy files whose target folder differs
     from their source folder.
-
-    mode: "move" or "copy"
-    dry_run: if True, nothing is actually written to disk -- status is
-             reported as if it would happen.
-    on_conflict: "rename" (add _dup1, _dup2 ...), "skip", or "overwrite"
-                 (hanya dipakai kalau rename_to_target_convention=False)
-    rename_to_target_convention: kalau True, file yang berpindah folder
-        akan diganti namanya mengikuti konvensi folder tujuan, contoh:
-        mannequin_002.jpg pindah ke fake_mask -> otomatis jadi
-        mask_XXX.jpg dengan XXX = nomor urut berikutnya yang belum
-        dipakai di folder fake_mask (dideteksi otomatis dari isi folder
-        saat ini, lalu terus bertambah untuk setiap file baru dalam run
-        yang sama supaya tidak tabrakan nama).
+    Pre-scans all target folders before moving any file to avoid cascade/ordering bugs.
     """
     assert mode in ("move", "copy")
     assert on_conflict in ("rename", "skip", "overwrite")
 
-    # counter per (dst_dir, prefix) -> [nomor_berikutnya, lebar_padding]
-    counters = {}
+    # Pre-scan seluruh folder tujuan sebelum eksekusi agar urutan pemindahan tidak saling mempengaruhi
+    counters: Dict[Tuple[str, str], List[int]] = {}
+    target_hashes: Dict[str, Dict[str, str]] = {}
+
+    unique_targets = {
+        (os.path.join(base_dir, t.target_folder), t.target_prefix)
+        for t in tasks if t.target_folder and t.target_prefix
+    }
+    for dst_dir, prefix in unique_targets:
+        max_num, width = _scan_existing_max(dst_dir, prefix)
+        counters[(dst_dir, prefix)] = [max_num + 1, width]
+        if skip_exact_duplicates_in_target and os.path.isdir(dst_dir):
+            target_hashes[dst_dir] = {}
+            for fname in os.listdir(dst_dir):
+                fpath = os.path.join(dst_dir, fname)
+                if os.path.isfile(fpath):
+                    target_hashes[dst_dir][_file_md5(fpath)] = fname
 
     for t in tasks:
         if t.status != "pending":
@@ -322,6 +331,15 @@ def execute_tasks(tasks, base_dir: str, mode: str = "move", dry_run: bool = True
             t.detail = f"File sumber hilang di disk: {src_path}"
             continue
 
+        if skip_exact_duplicates_in_target:
+            src_hash = _file_md5(src_path)
+            existing_dup = target_hashes.get(dst_dir, {}).get(src_hash)
+            if existing_dup:
+                t.status = "skipped"
+                t.final_filename = existing_dup
+                t.detail = f"Duplikat MD5 identik sudah ada di folder tujuan: {existing_dup}"
+                continue
+
         _, ext = os.path.splitext(t.filename)
 
         if rename_to_target_convention and t.target_prefix:
@@ -331,7 +349,7 @@ def execute_tasks(tasks, base_dir: str, mode: str = "move", dry_run: bool = True
                 counters[key] = [max_num + 1, width]
             next_num, width = counters[key]
             new_filename = f"{t.target_prefix}_{next_num:0{width}d}{ext.lower()}"
-            counters[key][0] += 1  # naikkan walau dry_run, biar preview konsisten
+            counters[key][0] += 1
             dst_path = os.path.join(dst_dir, new_filename)
         else:
             new_filename = t.filename
@@ -351,7 +369,6 @@ def execute_tasks(tasks, base_dir: str, mode: str = "move", dry_run: bool = True
                     new_path = os.path.join(dst_dir, f"{base}_dup{i}{e}")
                 dst_path = new_path
                 new_filename = os.path.basename(dst_path)
-            # "overwrite" -> biarkan dst_path apa adanya, akan ditimpa
 
         t.final_filename = new_filename
 
@@ -375,7 +392,8 @@ def execute_tasks(tasks, base_dir: str, mode: str = "move", dry_run: bool = True
     return tasks
 
 
-def write_report(tasks, report_path: str):
+def write_report(tasks: List[ActionResult], report_path: str):
+    os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
     with open(report_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -389,8 +407,7 @@ def write_report(tasks, report_path: str):
             ])
 
 
-def print_summary(tasks):
-    from collections import Counter
+def print_summary(tasks: List[ActionResult]):
     counts = Counter(t.status for t in tasks)
     print("\n=== RINGKASAN ===")
     for status, n in sorted(counts.items()):
@@ -398,20 +415,30 @@ def print_summary(tasks):
     print(f"  {'TOTAL':16s}: {len(tasks)}")
 
 
-def run_sorting(base_dir: str, csv_dir: str, mode: str = "move", dry_run: bool = True,
-                on_conflict: str = "rename", report_path: Optional[str] = None,
-                rename_to_target_convention: bool = False):
+def run_sorting(
+    base_dir: str,
+    csv_dir: str,
+    mode: str = "move",
+    dry_run: bool = True,
+    on_conflict: str = "rename",
+    report_path: Optional[str] = None,
+    rename_to_target_convention: bool = False,
+    skip_exact_duplicates_in_target: bool = False,
+) -> List[ActionResult]:
     """
     Fungsi utama untuk dipanggil dari notebook / script lain.
     Mengembalikan list[ActionResult].
-
-    rename_to_target_convention: kalau True, file yang pindah kategori akan
-        di-rename mengikuti prefix folder tujuan + nomor urut berikutnya,
-        mis. mannequin_002.jpg (pindah ke fake_mask) -> mask_281.jpg.
     """
     tasks = build_tasks(base_dir, csv_dir)
-    tasks = execute_tasks(tasks, base_dir, mode=mode, dry_run=dry_run, on_conflict=on_conflict,
-                           rename_to_target_convention=rename_to_target_convention)
+    tasks = execute_tasks(
+        tasks,
+        base_dir,
+        mode=mode,
+        dry_run=dry_run,
+        on_conflict=on_conflict,
+        rename_to_target_convention=rename_to_target_convention,
+        skip_exact_duplicates_in_target=skip_exact_duplicates_in_target,
+    )
     print_summary(tasks)
     if report_path:
         write_report(tasks, report_path)
@@ -419,19 +446,29 @@ def run_sorting(base_dir: str, csv_dir: str, mode: str = "move", dry_run: bool =
     return tasks
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def _main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_base = os.path.join(script_dir, "train")
+    default_csv = os.path.join(script_dir, "data", "relabeling_csv")
+    default_report = os.path.join(default_csv, "sorting_report.csv")
+
     parser = argparse.ArgumentParser(description="Sortir ulang dataset berdasarkan CSV relabeling.")
-    parser.add_argument("--base_dir", required=True, help="Folder induk yang berisi 6 folder kategori.")
-    parser.add_argument("--csv_dir", required=True, help="Folder tempat 6 file CSV berada.")
+    parser.add_argument("--base_dir", default=default_base, help="Folder induk yang berisi 6 folder kategori.")
+    parser.add_argument("--csv_dir", default=default_csv, help="Folder tempat 6 file CSV berada.")
     parser.add_argument("--mode", choices=["move", "copy"], default="move")
     parser.add_argument("--dry_run", action="store_true", help="Preview saja, tidak mengubah file apapun.")
     parser.add_argument("--on_conflict", choices=["rename", "skip", "overwrite"], default="rename")
-    parser.add_argument("--report", default="sorting_report.csv")
-    parser.add_argument("--rename_to_target_convention", action="store_true",
-                         help="Ganti nama file mengikuti prefix folder tujuan + nomor urut berikutnya.")
+    parser.add_argument("--report", default=default_report)
+    parser.add_argument(
+        "--rename_to_target_convention",
+        action="store_true",
+        help="Ganti nama file mengikuti prefix folder tujuan + nomor urut berikutnya.",
+    )
+    parser.add_argument(
+        "--skip_exact_duplicates_in_target",
+        action="store_true",
+        help="Lewati pemindahan jika file dengan MD5 identik sudah ada di folder tujuan.",
+    )
     args = parser.parse_args()
 
     run_sorting(
@@ -442,6 +479,7 @@ def _main():
         on_conflict=args.on_conflict,
         report_path=args.report,
         rename_to_target_convention=args.rename_to_target_convention,
+        skip_exact_duplicates_in_target=args.skip_exact_duplicates_in_target,
     )
 
 
