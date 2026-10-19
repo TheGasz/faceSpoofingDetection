@@ -1,0 +1,14 @@
+{
+  "label_encoder_classes": [
+    "fake_mannequin",
+    "fake_mask",
+    "fake_printed",
+    "fake_screen",
+    "fake_unknown",
+    "realperson"
+  ],
+  "img_size": 224,
+  "backbone": "efficientnet_b0",
+  "classifier_head": "linear",
+  "test_macro_f1": 0.9086864364677663
+}
